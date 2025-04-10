@@ -1,0 +1,604 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+import time
+import traceback
+import random
+import math
+
+def set_random_seed(seed):
+    """Set random seed to ensure experiment reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def process_time_features(df):
+    """Process timestamp columns and extract time features"""
+    print("Processing timestamp features...")
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            print(f"Processing timestamp column: {col}")
+            df[col] = pd.to_numeric(df[col].view('int64') // 10 ** 9)
+            
+            if 'time' in col.lower():
+                timestamps = pd.to_datetime(df[col], unit='s')
+                df[f'{col}_hour'] = timestamps.dt.hour
+                df[f'{col}_weekday'] = timestamps.dt.dayofweek
+                df[f'{col}_month'] = timestamps.dt.month
+                df[f'{col}_quarter'] = timestamps.dt.quarter
+    return df
+
+def feature_engineering(df):
+    """Perform feature engineering"""
+    print("Performing feature engineering...")
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    features = [col for col in df.columns if col != 'PM2.5' and not col.startswith('time_')]
+    
+    try:
+        if 'PM10' in df.columns and 'SO2' in df.columns:
+            df['PM10_SO2'] = df['PM10'] * df['SO2']
+        if 'NO2' in df.columns and 'O3' in df.columns:
+            df['NO2_O3'] = df['NO2'] * df['O3']
+        if 'max_temp' in df.columns and 'min_temp' in df.columns:
+            df['temp_diff'] = df['max_temp'] - df['min_temp']
+        
+        for col in features:
+            df[f'{col}_MA3'] = df[col].rolling(window=3).mean()
+            df[f'{col}_MA7'] = df[col].rolling(window=7).mean()
+            df[f'{col}_STD3'] = df[col].rolling(window=3).std()
+        
+        df = df.fillna(method='bfill').fillna(method='ffill')
+    except Exception as e:
+        print(f"Error during feature engineering: {str(e)}")
+    
+    return df
+
+def simple_data_preprocessing(df, target_col='PM2.5'):
+    """Perform dimensionless processing according to paper formula (1)"""
+    print("Using paper formula (1) for dimensionless processing...")
+    features = [col for col in df.columns if col != target_col]
+    X = df[features].values
+    y = df[target_col].values.reshape(-1, 1)
+    
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y)
+    
+    X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y_scaled, test_size=0.2775, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.545, random_state=42)
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, scaler_y
+
+def create_sequences(X, y, seq_length):
+    """Create time series data"""
+    Xs, ys = [], []
+    
+    for i in range(len(X) - seq_length):
+        x_seq = X[i:(i + seq_length)]
+        y_val = y[i + seq_length - 1]
+        
+        if not (np.isnan(x_seq).any() or np.isnan(y_val).any() or 
+               np.isinf(x_seq).any() or np.isinf(y_val).any()):
+            Xs.append(x_seq)
+            ys.append(y_val)
+    
+    return np.array(Xs), np.array(ys)
+
+class TDA_RNN(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1, num_layers=2, dropout=0.2):
+        super(TDA_RNN, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        lstm_dropout = 0 if num_layers == 1 else dropout
+        
+        self.feature_encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout
+        )
+        
+        self.temporal_encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout
+        )
+        
+        self.fusion_encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout
+        )
+        
+        self.decoder_lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        self.decoder_fusion = nn.Linear(hidden_size + input_size, hidden_size)
+        self.decoder_output = nn.Linear(hidden_size, output_size)
+        
+        self.dropout_layer = nn.Dropout(dropout)
+        
+        self.W_1e = nn.Linear(2*hidden_size, hidden_size)
+        self.U_1e = nn.Linear(input_size, hidden_size)
+        self.v_1e = nn.Parameter(torch.FloatTensor(hidden_size).uniform_(-0.1, 0.1))
+        
+        self.W_2e = nn.Linear(2*hidden_size, hidden_size)
+        self.U_2e = nn.Linear(input_size, hidden_size)
+        self.v_2e = nn.Parameter(torch.FloatTensor(hidden_size).uniform_(-0.1, 0.1))
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize model weights"""
+        for name, param in self.named_parameters():
+            if 'weight' in name and 'lstm' not in name:
+                nn.init.xavier_normal_(param)
+    
+    def compute_category_attention(self, x, h_states, s_states):
+        batch_size, seq_length, input_size = x.size()
+        device = x.device
+        
+        attention_scores = torch.zeros(batch_size, seq_length, input_size).to(device)
+        
+        for t in range(seq_length):
+            h_t_minus_1 = h_states[t-1] if t > 0 else h_states[0]
+            s_t = s_states[t]
+            
+            h_s_concat = torch.cat([h_t_minus_1, s_t], dim=1)
+            h_s_transform = self.W_1e(h_s_concat)
+            
+            for k in range(input_size):
+                x_k = x[:, t, k].unsqueeze(-1)
+                x_k_transform = self.U_1e(x_k.repeat(1, input_size))
+                
+                attention = torch.tanh(h_s_transform + x_k_transform)
+                score = torch.matmul(attention, self.v_1e)
+                attention_scores[:, t, k] = score
+        
+        attention_weights = F.softmax(attention_scores, dim=2)
+        return attention_weights
+    
+    def compute_temporal_attention(self, x, h_states, s_states):
+        batch_size, seq_length, input_size = x.size()
+        device = x.device
+        
+        attention_scores = torch.zeros(batch_size, seq_length).to(device)
+        
+        for k in range(self.num_layers):
+            h_k_minus_1 = h_states[k-1] if k > 0 else h_states[0]
+            s_k_minus_1 = s_states[k-1] if k > 0 else s_states[0]
+            
+            h_s_concat = torch.cat([h_k_minus_1, s_k_minus_1], dim=1)
+            h_s_transform = self.W_2e(h_s_concat)
+            
+            for t in range(seq_length):
+                x_t = x[:, t, :]
+                x_t_transform = self.U_2e(x_t)
+                
+                attention = torch.tanh(h_s_transform + x_t_transform)
+                score = torch.matmul(attention, self.v_2e)
+                attention_scores[:, t] += score
+        
+        attention_weights = F.softmax(attention_scores, dim=1)
+        return attention_weights
+    
+    def forward(self, x, y_history=None):
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+        
+        batch_size, seq_length, input_size = x.size()
+        device = x.device
+        
+        if y_history is None:
+            y_history = x
+        
+        h_t = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+        s_t = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+        
+        h_states = []
+        s_states = []
+        
+        for t in range(seq_length):
+            _, (h_t, s_t) = self.feature_encoder_lstm(
+                x[:, t:t+1, :],
+                (h_t, s_t)
+            )
+            h_states.append(h_t[-1])
+            s_states.append(s_t[-1])
+        
+        h_states = torch.stack(h_states)
+        s_states = torch.stack(s_states)
+        
+        category_attention = self.compute_category_attention(x, h_states, s_states)
+        
+        temporal_output, (temporal_h, temporal_s) = self.temporal_encoder_lstm(x)
+        temporal_attention = self.compute_temporal_attention(x, temporal_h, temporal_s)
+        
+        temporal_attention = temporal_attention.unsqueeze(-1).expand(-1, -1, input_size)
+        
+        combined_attention = category_attention + temporal_attention
+        
+        weighted_input = x * combined_attention
+        
+        fusion_output, (fusion_h, fusion_c) = self.fusion_encoder_lstm(weighted_input)
+        
+        h_t_minus_1 = fusion_output[:, -1, :]
+        y_hist_last = y_history[:, -1, :]
+        
+        decoder_input = torch.cat([y_hist_last, h_t_minus_1], dim=1)
+        decoder_hidden = self.decoder_fusion(decoder_input)
+        decoder_hidden = torch.tanh(decoder_hidden)
+        decoder_hidden = self.dropout_layer(decoder_hidden)
+        
+        decoder_hidden = decoder_hidden.unsqueeze(1)
+        decoder_output, _ = self.decoder_lstm(decoder_hidden)
+        
+        final_hidden = decoder_output[:, -1, :]
+        final_hidden = self.dropout_layer(final_hidden)
+        predictions = self.decoder_output(final_hidden)
+        
+        return predictions
+
+def evaluate_model(y_true, y_pred, scaler_y=None):
+    """Evaluate model performance and return multiple evaluation metrics"""
+    if scaler_y is not None:
+        y_true = scaler_y.inverse_transform(y_true.reshape(-1, 1))
+        y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1))
+    
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    epsilon = 1e-8
+    mape = np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + epsilon))) * 100
+    
+    return {
+        'mse': mse,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
+        'mape': mape
+    }
+
+def train_model_simple(model, X_train, y_train, X_val, y_val, X_test, y_test, 
+                      scaler_y=None, epochs=200, lr=0.001, batch_size=32, weight_decay=1e-5):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    
+    X_train_tensor = torch.FloatTensor(X_train).to(device)
+    y_train_tensor = torch.FloatTensor(y_train).to(device)
+    X_val_tensor = torch.FloatTensor(X_val).to(device)
+    y_val_tensor = torch.FloatTensor(y_val).to(device)
+    X_test_tensor = torch.FloatTensor(X_test).to(device)
+    y_test_tensor = torch.FloatTensor(y_test).to(device)
+    
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
+    
+    best_val_loss = float('inf')
+    best_model = None
+    patience = 20
+    patience_counter = 0
+    
+    for epoch in range(epochs):
+        model.train()
+        
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        
+        train_loss = 0
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item() * batch_X.size(0)
+        
+        train_loss /= len(train_dataset)
+        
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_tensor)
+            val_loss = criterion(val_outputs, y_val_tensor)
+            
+            print(f'Epoch {epoch+1}/{epochs}, Training loss: {train_loss:.6f}, Validation loss: {val_loss.item():.6f}')
+            
+            scheduler.step(val_loss)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = model.state_dict().copy()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f'Early stopping: Validation loss did not improve for {patience} epochs')
+                    break
+    
+    if best_model is not None:
+        model.load_state_dict(best_model)
+    
+    model.eval()
+    with torch.no_grad():
+        test_outputs = model(X_test_tensor)
+        test_pred = test_outputs.cpu().numpy()
+        test_true = y_test_tensor.cpu().numpy()
+        
+        results = evaluate_model(test_true, test_pred, scaler_y)
+        
+        return model, results
+
+def parameter_sensitivity_analysis(df, target_col='PM2.5', 
+                               T_values=[3, 6, 9, 12, 15], 
+                               m_values=[8, 16, 32, 64, 128],
+                               epochs=200, n_trials=3):
+    print("Starting parameter sensitivity analysis...")
+    print(f"Time window length T: {T_values}")
+    print(f"Hidden state sequence length m: {m_values}")
+    print(f"Each parameter combination repeats {n_trials} experiments")
+
+    base_seed = 42
+    set_random_seed(base_seed)
+    
+    output_size = 1
+
+    print("\nPreprocessing data...")
+    df = process_time_features(df)
+    df = feature_engineering(df)
+    
+    X_train_base, X_val_base, X_test_base, y_train_base, y_val_base, y_test_base, scaler_y = simple_data_preprocessing(df, target_col)
+    print(f"Base data split completed - Training set: {X_train_base.shape}, Validation set: {X_val_base.shape}, Test set: {X_test_base.shape}")
+    
+    results = {}
+    std_results = {}
+    
+    try:
+        for T in T_values:
+            results[T] = {}
+            std_results[T] = {}
+            print(f"\n==========================")
+            print(f"Testing time window length T = {T}")
+            print(f"==========================")
+            
+            X_train_seq, y_train_seq = create_sequences(X_train_base, y_train_base, seq_length=T)
+            X_val_seq, y_val_seq = create_sequences(X_val_base, y_val_base, seq_length=T)
+            X_test_seq, y_test_seq = create_sequences(X_test_base, y_test_base, seq_length=T)
+            
+            if X_train_seq.shape[0] == 0 or X_val_seq.shape[0] == 0 or X_test_seq.shape[0] == 0:
+                print(f"Warning: Sequence data for T={T} is invalid, skipping this T value")
+                continue
+                
+            for m in m_values:
+                print(f"\n--------------------------")
+                print(f"Testing hidden state sequence length m = {m}")
+                print(f"--------------------------")
+                rmse_values = []
+                
+                for trial in range(n_trials):
+                    try:
+                        trial_seed = base_seed + T * 100 + m + trial
+                        set_random_seed(trial_seed)
+                        print(f"    Starting experiment {trial + 1} (seed={trial_seed})")
+                        
+                        model = TDA_RNN(
+                            input_size=X_train_seq.shape[2],
+                            hidden_size=m,
+                            output_size=output_size,
+                            dropout=0.2
+                        )
+                        
+                        _, results_dict = train_model_simple(
+                            model, 
+                            X_train_seq, y_train_seq, 
+                            X_val_seq, y_val_seq, 
+                            X_test_seq, y_test_seq,
+                            scaler_y=scaler_y, 
+                            epochs=epochs, 
+                            batch_size=16,
+                            lr=0.0005,
+                            weight_decay=1e-5
+                        )
+                        
+                        if results_dict and 'rmse' in results_dict:
+                            rmse = results_dict['rmse']
+                            rmse_values.append(rmse)
+                            print(f"    Trial {trial + 1}: RMSE = {rmse:.4f}")
+                        else:
+                            print(f"    Warning: Trial {trial + 1} did not return valid RMSE value")
+                        
+                    except Exception as e:
+                        print(f"    Error: Trial {trial + 1} failed: {str(e)}")
+                        continue
+                
+                if rmse_values:
+                    if len(rmse_values) > 2:
+                        mean_rmse = np.mean(rmse_values)
+                        std_rmse = np.std(rmse_values)
+                        filtered_rmse = [rmse for rmse in rmse_values if abs(rmse - mean_rmse) <= 3 * std_rmse]
+                        if len(filtered_rmse) < len(rmse_values):
+                            print(f"    Note: Outliers detected, filtered from {len(rmse_values)} results to {len(filtered_rmse)}")
+                            rmse_values = filtered_rmse
+                    
+                    mean_rmse = np.mean(rmse_values)
+                    std_rmse = np.std(rmse_values)
+                    results[T][m] = mean_rmse
+                    std_results[T][m] = std_rmse
+                    print(f"    Average performance for parameter combination (T={T}, m={m}):")
+                    print(f"    RMSE = {mean_rmse:.4f} ± {std_rmse:.4f}")
+                else:
+                    print(f"    Warning: Parameter combination (T={T}, m={m}) did not produce valid results")
+        
+        best_rmse = float('inf')
+        best_T = None
+        best_m = None
+        
+        for T in results:
+            for m in results[T]:
+                if results[T][m] < best_rmse:
+                    best_rmse = results[T][m]
+                    best_T = T
+                    best_m = m
+        
+        if best_T is not None and best_m is not None:
+            print(f"\nBest parameter combination: T={best_T}, m={best_m}, RMSE={best_rmse:.4f}")
+            
+    except Exception as e:
+        print(f"\nError occurred during parameter sensitivity analysis: {str(e)}")
+        traceback.print_exc()
+        return None, None
+    
+    return results, std_results
+
+def visualize_parameter_sensitivity(results, std_results, T_values, m_values):
+    """Parameter sensitivity analysis result visualization function"""
+    plt.figure(figsize=(16, 6))
+    
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    markers = ['o', 's', '^', 'D', 'v']
+    
+    plt.subplot(1, 2, 1)
+    
+    all_rmse_values = []
+    for T in results:
+        for m in results[T]:
+            all_rmse_values.append(results[T][m])
+    
+    if all_rmse_values:
+        rmse_min = min(all_rmse_values) * 0.95
+        rmse_max = max(all_rmse_values) * 1.15
+        
+        for i, T in enumerate(sorted(results.keys())):
+            if T in results:
+                m_list = sorted(results[T].keys())
+                rmse_list = [results[T][m] for m in m_list]
+                std_list = [std_results[T][m] for m in m_list]
+                
+                color_idx = i % len(colors)
+                marker_idx = i % len(markers)
+                
+                plt.errorbar(m_list, rmse_list, yerr=std_list, 
+                            marker=markers[marker_idx], markersize=8,
+                            color=colors[color_idx], linewidth=2,
+                            label=f'T={T}', capsize=5)
+        
+        plt.ylim(rmse_min, rmse_max)
+    
+    plt.xlabel('Hidden State Sequence Length (m)')
+    plt.ylabel('RMSE')
+    plt.title('Effect of Hidden State Sequence Length m\nfor Different Time Window Lengths T')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+    
+    plt.subplot(1, 2, 2)
+    
+    if all_rmse_values:
+        for i, m in enumerate(sorted(m_values)):
+            T_list = []
+            rmse_list = []
+            std_list = []
+            for T in sorted(T_values):
+                if T in results and m in results[T]:
+                    T_list.append(T)
+                    rmse_list.append(results[T][m])
+                    std_list.append(std_results[T][m])
+            
+            if T_list:
+                color_idx = i % len(colors)
+                marker_idx = i % len(markers)
+                
+                plt.errorbar(T_list, rmse_list, yerr=std_list, 
+                            marker=markers[marker_idx], markersize=8,
+                            color=colors[color_idx], linewidth=2,
+                            label=f'm={m}', capsize=5)
+        
+        plt.ylim(rmse_min, rmse_max)
+    
+    plt.xlabel('Time Window Length (T)')
+    plt.ylabel('RMSE')
+    plt.title('Effect of Time Window Length T\nfor Different Hidden State Sequence Lengths m')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig('parameter_sensitivity.png', dpi=300, bbox_inches='tight')
+    print("\nParameter sensitivity analysis results saved to parameter_sensitivity.png")
+
+def main():
+    print("Loading data...")
+    try:
+        df = pd.read_excel('data.xlsx')
+        
+        print("\nPerforming data preprocessing...")
+        df = process_time_features(df)
+        df = feature_engineering(df)
+        
+    except Exception as e:
+        print(f"Failed to load or preprocess data: {str(e)}")
+        traceback.print_exc()
+        exit(1)
+
+    print("\nStarting parameter sensitivity analysis...")
+    try:
+        results, std_results = parameter_sensitivity_analysis(
+            df=df,
+            target_col='PM2.5',
+            T_values=[3, 6, 9, 12, 15],
+            m_values=[8, 16, 32, 64, 128],
+            epochs=200,
+            n_trials=3
+        )
+
+        if results is not None and std_results is not None:
+            print("\nGenerating parameter sensitivity visualization...")
+            visualize_parameter_sensitivity(
+                results, 
+                std_results, 
+                [3, 6, 9, 12, 15], 
+                [8, 16, 32, 64, 128]
+            )
+            print("\nParameter sensitivity analysis completed, results saved to parameter_sensitivity.png")
+        else:
+            print("\nParameter sensitivity analysis failed, unable to generate visualization.")
+
+    except Exception as e:
+        print(f"\nError occurred during parameter sensitivity analysis: {str(e)}")
+        traceback.print_exc()
+        return
+
+    print("\nParameter sensitivity analysis workflow completed!")
+
+if __name__ == "__main__":
+    main()

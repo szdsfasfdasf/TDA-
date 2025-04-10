@@ -1,0 +1,1718 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge, LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+import matplotlib.pyplot as plt
+import time
+from tqdm import tqdm
+import copy
+import math
+import seaborn as sns
+
+
+# 数据归一化和反归一化函数
+def normalize_data(data):
+    """使用最小-最大归一化方法对数据进行归一化处理，公式(1)
+    x* = (x - x_min)/(x_max - x_min)
+    """
+    min_vals = np.min(data, axis=0)
+    max_vals = np.max(data, axis=0)
+    # 避免除以零，使用一个很小的值
+    denominator = np.maximum(max_vals - min_vals, 1e-10)
+    normalized_data = (data - min_vals) / denominator
+    return normalized_data, min_vals, max_vals
+
+
+def denormalize_data(normalized_data, min_vals, max_vals):
+    """反归一化处理
+    x = x* * (x_max - x_min) + x_min
+    """
+    return normalized_data * (max_vals - min_vals) + min_vals
+
+
+# 处理时间戳特征函数
+def process_time_features(df):
+    """处理时间戳列并提取时间特征"""
+    print("处理时间戳特征...")
+    # 处理时间戳列
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            print(f"处理时间戳列: {col}")
+            # 使用view()替代astype()避免FutureWarning
+            df[col] = pd.to_numeric(df[col].view('int64') // 10 ** 9)
+            
+            # 如果列名是时间相关的，可以进一步提取时间特征
+            if '时间' in col:
+                # 将Unix时间戳转回datetime进行特征提取
+                timestamps = pd.to_datetime(df[col], unit='s')
+                df[f'{col}_小时'] = timestamps.dt.hour
+                df[f'{col}_星期几'] = timestamps.dt.dayofweek
+                df[f'{col}_月份'] = timestamps.dt.month
+                df[f'{col}_季度'] = timestamps.dt.quarter
+    
+    return df
+
+
+# 特征工程函数
+def feature_engineering(df):
+    """执行特征工程"""
+    print("执行特征工程...")
+    # 填充缺失值
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    
+    # 提取特征列
+    features = [col for col in df.columns if col != 'PM2.5' and not col.startswith('时间_')]
+    
+    try:
+        # 添加特征交互
+        if 'PM10' in df.columns and 'SO2' in df.columns:
+            df['PM10_SO2'] = df['PM10'] * df['SO2']
+        if 'NO2' in df.columns and 'O3' in df.columns:
+            df['NO2_O3'] = df['NO2'] * df['O3']
+        if '最高温' in df.columns and '最低温' in df.columns:
+            df['温差'] = df['最高温'] - df['最低温']
+        
+        # 填充特征工程产生的NA值
+        df = df.fillna(method='bfill').fillna(method='ffill')
+        
+    except Exception as e:
+        print(f"特征工程时发生错误: {str(e)}")
+    
+    return df
+
+
+# 简化数据预处理方法，使用与第二个实现一致的比例划分
+def simple_data_preprocessing(df, target_col='PM2.5', sequence_length=3):
+    """简化数据预处理，使用0.7225:0.1275:0.15的数据划分比例，并按照论文公式(1)进行归一化"""
+    print("使用简化数据预处理方法...")
+    
+    # 分离特征和目标
+    features = [col for col in df.columns if col != target_col]
+    X = df[features].values
+    y = df[target_col].values.reshape(-1, 1)
+    
+    # 使用MinMaxScaler进行归一化 - 按照论文公式(1)
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y)
+    
+    # 创建序列数据
+    if sequence_length > 1:
+        X_scaled, y_scaled = create_sequences(X_scaled, y_scaled, sequence_length)
+    
+    # 划分数据集 - 使用0.7225:0.1275:0.15的比例
+    n_samples = len(X_scaled)
+    train_size = int(n_samples * 0.7225)
+    val_size = int(n_samples * 0.1275)
+    
+    # 首先划分训练集
+    X_train = X_scaled[:train_size]
+    y_train = y_scaled[:train_size]
+    
+    # 然后划分验证集
+    X_val = X_scaled[train_size:train_size+val_size]
+    y_val = y_scaled[train_size:train_size+val_size]
+    
+    # 最后划分测试集
+    X_test = X_scaled[train_size+val_size:]
+    y_test = y_scaled[train_size+val_size:]
+    
+    print(f"数据集划分完成 - 训练集: {len(X_train)}, 验证集: {len(X_val)}, 测试集: {len(X_test)}")
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, scaler_y
+
+
+# 数据归一化和准备函数
+def normalize_and_prepare_data(df, target_col='PM2.5'):
+    """按照论文公式(1)进行归一化处理，并准备特征和目标变量
+    x* = (x - x_min)/(x_max - x_min)
+    """
+    print("按照论文公式(1)进行归一化处理...")
+    # 提取特征和目标列
+    features = [col for col in df.columns if col != target_col]
+    
+    X = df[features].values
+    y = df[target_col].values.reshape(-1, 1)
+    
+    # 使用MinMaxScaler进行归一化 - 按照论文公式(1)
+    X_scaler = MinMaxScaler()
+    y_scaler = MinMaxScaler()
+    
+    X_normalized = X_scaler.fit_transform(X)
+    y_normalized = y_scaler.fit_transform(y)
+    
+    return X_normalized, y_normalized, y_scaler
+
+
+# 创建时间序列数据
+def create_sequences(X, y, seq_length):
+    """创建时间序列数据"""
+    Xs, ys = [], []
+    for i in range(len(X) - seq_length):
+        Xs.append(X[i:i + seq_length])
+        ys.append(y[i + seq_length])
+    return np.array(Xs), np.array(ys)
+
+
+# 评估模型函数 - 简化版本
+def evaluate_model(y_true, y_pred, scaler_y):
+    """评估模型性能并返回多种评估指标"""
+    # 反标准化
+    if scaler_y is not None:
+        y_true = scaler_y.inverse_transform(y_true)
+        y_pred = scaler_y.inverse_transform(y_pred)
+    
+    # 计算评估指标
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    # 计算MAPE (平均绝对百分比误差)
+    epsilon = 1e-8  # 避免除零
+    mape = np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + epsilon))) * 100
+    
+    print(f'评估指标 - MSE: {mse:.6f}, RMSE: {rmse:.6f}, MAE: {mae:.6f}, R²: {r2:.6f}, MAPE: {mape:.6f}%')
+    
+    return {
+        'mse': mse,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
+        'mape': mape
+    }
+
+
+# 正确的BPNN模型
+class BPNN(nn.Module):
+    """
+    反向传播神经网络 - 标准多层感知器实现
+    
+    这是一个经典的前馈神经网络，通过反向传播算法训练。
+    它适用于各种回归和分类任务，但不像RNN那样专门处理序列数据。
+    """
+    def __init__(self, input_size, hidden_size=128, output_size=1, dropout=0.2):
+        """
+        初始化BPNN模型
+        
+        参数:
+            input_size: 输入特征的维度
+            hidden_size: 隐藏层的神经元数量
+            output_size: 输出维度
+            dropout: Dropout比率，用于防止过拟合
+        """
+        super(BPNN, self).__init__()
+        
+        # 模型参数
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.dropout_rate = dropout
+        
+        # 对于序列数据，需要展平
+        self.flatten = nn.Flatten(start_dim=1)
+        
+        # 网络层定义
+        # 第一层：输入层到第一隐藏层
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # 第二层：第一隐藏层到第二隐藏层
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_size // 2)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # 输出层：第二隐藏层到输出层
+        self.fc3 = nn.Linear(hidden_size // 2, output_size)
+        
+        # 初始化权重
+        self._init_weights()
+        
+    def _init_weights(self):
+        """
+        使用Xavier初始化权重，有助于解决梯度消失/爆炸问题
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, x, y_prev=None):
+        """
+        BPNN前向传播
+        
+        参数:
+            x: 输入数据，可以是2D [batch_size, features]或3D [batch_size, seq_len, features]
+            y_prev: 保持与其他模型一致的接口，但在BPNN中不使用
+            
+        返回:
+            output: 预测结果，形状为[batch_size, output_size]
+        """
+        # 处理输入数据 - BPNN需要将序列数据展平为特征向量
+        if len(x.shape) == 3:
+            x = self.flatten(x)
+        
+        batch_size = x.size(0)
+        
+        # 前向传播过程
+        # 第一层
+        x = self.fc1(x)
+        if batch_size > 1:  # 批归一化需要批量大小>1
+            x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout1(x)
+        
+        # 第二层
+        x = self.fc2(x)
+        if batch_size > 1:
+            x = self.bn2(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        
+        # 输出层
+        x = self.fc3(x)
+        
+        return x
+
+
+# 标准的GRU模型实现
+class GRU(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1, num_layers=2, dropout=0.2):
+        """
+        门控循环单元（GRU）网络实现 - 适合时序数据的标准实现
+        
+        参数:
+            input_size: 输入特征的维度
+            hidden_size: GRU隐藏状态的维度
+            output_size: 输出维度
+            num_layers: GRU层数
+            dropout: Dropout比率
+        """
+        super(GRU, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout_rate = dropout
+        
+        # 主要的GRU层
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0 if num_layers == 1 else dropout
+        )
+        
+        # 批归一化有助于训练稳定性
+        self.bn = nn.BatchNorm1d(hidden_size)
+        
+        # 输出层
+        self.fc1 = nn.Linear(hidden_size, hidden_size//2)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_size//2, output_size)
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化GRU和线性层的权重"""
+        for name, param in self.named_parameters():
+            if 'weight_ih' in name:  # 输入到隐藏层的权重
+                nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name:  # 隐藏层到隐藏层的权重
+                nn.init.orthogonal_(param)  # 正交初始化有助于解决长序列的梯度问题
+            elif 'bias' in name:  # 偏置项
+                nn.init.zeros_(param)
+            elif 'fc' in name and 'weight' in name:  # 全连接层权重
+                nn.init.xavier_normal_(param)
+        
+    def forward(self, x, y_prev=None):
+        """
+        GRU前向传播 - 处理时序数据
+        
+        参数:
+            x: 输入数据，形状为[batch_size, seq_length, input_size]
+            y_prev: 为保持API一致性而保留的参数，不使用
+            
+        返回:
+            output: 预测结果，形状为[batch_size, output_size]
+        """
+        # 确保输入是3D的 [batch_size, seq_length, input_size]
+        if len(x.shape) == 2:
+            # 如果输入是2D的，添加时间步维度：[batch_size, features] -> [batch_size, 1, features]
+            x = x.unsqueeze(1)
+        
+        # GRU处理序列数据 - output: [batch_size, seq_len, hidden_size]
+        # hidden: [num_layers, batch_size, hidden_size]
+        output, hidden = self.gru(x)
+        
+        # 使用最后一个时间步的输出
+        last_output = output[:, -1, :]  # [batch_size, hidden_size]
+        
+        # 应用批归一化 - 仅当batch_size > 1时
+        if last_output.size(0) > 1:
+            last_output = self.bn(last_output)
+        
+        # 输出层处理
+        x = F.relu(self.fc1(last_output))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
+
+
+# 标准的LSTM模型实现
+class LSTM(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1, num_layers=2, dropout=0.2):
+        """
+        长短时记忆网络(LSTM)实现 - 适合长时序依赖的标准实现
+        
+        参数:
+            input_size: 输入特征的维度
+            hidden_size: LSTM隐藏状态的维度
+            output_size: 输出维度
+            num_layers: LSTM层数
+            dropout: Dropout比率
+        """
+        super(LSTM, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout_rate = dropout
+        
+        # LSTM层 - 处理序列数据
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0 if num_layers == 1 else dropout
+        )
+        
+        # 批归一化层 - 有助于网络训练稳定
+        self.bn = nn.BatchNorm1d(hidden_size)
+        
+        # 输出层
+        self.fc1 = nn.Linear(hidden_size, hidden_size//2)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_size//2, output_size)
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化LSTM和线性层的权重"""
+        for name, param in self.named_parameters():
+            if 'weight_ih' in name:  # 输入到隐藏层的权重
+                nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name:  # 隐藏层到隐藏层的权重
+                nn.init.orthogonal_(param)  # 正交初始化有助于解决长序列的梯度问题
+            elif 'bias' in name:  # 偏置项
+                # LSTM有四个偏置项，将遗忘门偏置初始化为1，其他为0
+                param.data.fill_(0)
+                # f gate bias = 1
+                if 'bias_ih' in name:
+                    n = param.size(0)
+                    param.data[n//4:n//2].fill_(1.0)
+            elif 'fc' in name and 'weight' in name:  # 全连接层权重
+                nn.init.xavier_normal_(param)
+        
+    def forward(self, x, y_prev=None):
+        """
+        LSTM前向传播 - 处理时序数据
+        
+        参数:
+            x: 输入数据，形状为[batch_size, seq_length, input_size]
+            y_prev: 为保持API一致性而保留的参数，不使用
+            
+        返回:
+            output: 预测结果，形状为[batch_size, output_size]
+        """
+        # 确保输入是3D的 [batch_size, seq_length, input_size]
+        if len(x.shape) == 2:
+            # 如果输入是2D的，添加时间步维度：[batch_size, features] -> [batch_size, 1, features]
+            x = x.unsqueeze(1)
+            
+        # LSTM处理序列数据 
+        # output: [batch_size, seq_len, hidden_size]
+        # hidden: [num_layers, batch_size, hidden_size]
+        # cell: [num_layers, batch_size, hidden_size]
+        output, (hidden, cell) = self.lstm(x)
+        
+        # 使用最后一个时间步的输出
+        last_output = output[:, -1, :]  # [batch_size, hidden_size]
+        
+        # 应用批归一化 - 仅当batch_size > 1时
+        if last_output.size(0) > 1:
+            last_output = self.bn(last_output)
+        
+        # 输出层处理
+        x = F.relu(self.fc1(last_output))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
+
+
+
+
+# TDA-RNN模型实现
+class TDA_RNN(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1, num_layers=2, dropout=0.2):
+        super(TDA_RNN, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        # 设置正确的dropout值
+        lstm_dropout = 0 if num_layers == 1 else dropout
+        
+        # 特征编码器LSTM - 用于类别注意力
+        self.feature_encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout
+        )
+        
+        # 时序编码器LSTM - 用于时序注意力
+        self.temporal_encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout
+        )
+        
+        # 融合编码器LSTM - 用于处理注意力加权后的特征
+        self.fusion_encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout
+        )
+        
+        # 解码器LSTM - 按照论文要求修改，接收完整的历史数据
+        self.decoder_lstm = nn.LSTM(
+            input_size=input_size + hidden_size,  # 输入包括历史数据和隐藏状态
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        # 解码器相关层 - 修改以处理完整的历史数据
+        self.decoder_fusion = nn.Linear(hidden_size + input_size, hidden_size)  # 融合历史数据和隐藏状态
+        self.decoder_output = nn.Linear(hidden_size, output_size)
+        
+        # Dropout层
+        self.dropout_layer = nn.Dropout(dropout)
+        
+        # 类别注意力参数 - 按照论文公式(5)(6)实现
+        self.W_1e = nn.Linear(2*hidden_size, hidden_size)  # W_{1,e}
+        self.U_1e = nn.Linear(1, hidden_size)     # U_{1,e} - 修改输入维度为1
+        self.v_1e = nn.Parameter(torch.FloatTensor(hidden_size).uniform_(-0.1, 0.1))  # v_{1,e}
+        
+        # 时序注意力参数 - 按照论文公式(7)(8)实现
+        self.W_2e = nn.Linear(2*hidden_size, hidden_size)  # W_{2,e}
+        self.U_2e = nn.Linear(input_size, hidden_size)     # U_{2,e}
+        self.v_2e = nn.Parameter(torch.FloatTensor(hidden_size).uniform_(-0.1, 0.1))  # v_{2,e}
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化模型权重"""
+        for name, param in self.named_parameters():
+            if 'weight' in name and 'lstm' not in name:
+                nn.init.xavier_normal_(param)
+    
+    def compute_category_attention(self, x, h_states, s_states):
+        """
+        计算类别注意力 - 严格按照论文公式(5)(6)实现
+        Args:
+            x: 输入序列 [batch_size, seq_length, input_size]
+            h_states: 所有时间步的隐藏状态 [seq_length, batch_size, hidden_size]
+            s_states: 所有时间步的细胞状态 [seq_length, batch_size, hidden_size]
+        Returns:
+            类别注意力权重 [batch_size, seq_length, input_size]
+        """
+        batch_size, seq_length, input_size = x.size()
+        device = x.device
+        
+        # 初始化注意力权重
+        attention_weights = torch.zeros(batch_size, seq_length, input_size).to(device)
+        
+        # 对每个时间步计算注意力
+        for t in range(seq_length):
+            # 获取t-1时刻的隐藏状态和t时刻的细胞状态
+            h_t_minus_1 = h_states[t-1] if t > 0 else h_states[0]  # [batch_size, hidden_size]
+            s_t = s_states[t]  # [batch_size, hidden_size]
+            
+            # 拼接状态 [h_{t-1}; s_t]
+            h_s_concat = torch.cat([h_t_minus_1, s_t], dim=1)  # [batch_size, 2*hidden_size]
+            
+            # 计算W_{1,e}[h_{t-1}; s_t]
+            h_s_transform = self.W_1e(h_s_concat)  # [batch_size, hidden_size]
+            
+            # 初始化当前时间步的注意力分数
+            attention_scores = torch.zeros(batch_size, input_size).to(device)
+            
+            # 对每个特征k独立计算注意力分数 - 严格按照公式(5)
+            for k in range(input_size):
+                # 获取特征k在时间步t的值 x_{t,k}
+                x_t_k = x[:, t, k]  # [batch_size]
+                
+                # 将标量特征扩展为向量以匹配隐藏状态维度
+                x_t_k = x_t_k.unsqueeze(1)  # [batch_size, 1]
+                
+                # 计算U_{1,e}x_{t,k} - 确保输出维度与隐藏状态匹配
+                x_k_transform = self.U_1e(x_t_k)  # [batch_size, hidden_size]
+                
+                # 计算注意力分数 e_{t,k} = v_{1,e}^T tanh(W_{1,e}[h_{t-1}; s_t] + U_{1,e}x_{t,k})
+                attention = torch.tanh(h_s_transform + x_k_transform)  # [batch_size, hidden_size]
+                e_t_k = torch.matmul(attention, self.v_1e)  # [batch_size]
+                attention_scores[:, k] = e_t_k
+            
+            # 使用Softmax计算注意力权重 α_{t,k} - 严格按照公式(6)
+            # 对特征维度进行归一化，确保每个时间步t的所有特征k的权重和为1
+            attention_weights[:, t, :] = F.softmax(attention_scores, dim=1)
+        
+        return attention_weights
+    
+    def compute_temporal_attention(self, x, h_states, s_states):
+        """
+        计算时序注意力 - 严格按照论文公式(7)(8)实现
+        Args:
+            x: 输入序列 [batch_size, seq_length, input_size]
+            h_states: 所有层的隐藏状态 [num_layers, batch_size, hidden_size]
+            s_states: 所有层的细胞状态 [num_layers, batch_size, hidden_size]
+        Returns:
+            时序注意力权重 [batch_size, seq_length]
+        """
+        batch_size, seq_length, input_size = x.size()
+        device = x.device
+        
+        # 初始化注意力分数
+        attention_scores = torch.zeros(batch_size, seq_length).to(device)
+        
+        # 对每一层计算注意力
+        for k in range(self.num_layers):
+            # 获取k-1层的状态
+            h_k_minus_1 = h_states[k-1] if k > 0 else h_states[0]  # [batch_size, hidden_size]
+            s_k_minus_1 = s_states[k-1] if k > 0 else s_states[0]  # [batch_size, hidden_size]
+            
+            # 拼接状态
+            h_s_concat = torch.cat([h_k_minus_1, s_k_minus_1], dim=1)  # [batch_size, 2*hidden_size]
+            h_s_transform = self.W_2e(h_s_concat)  # [batch_size, hidden_size]
+            
+            # 对每个时间步计算注意力分数
+            for t in range(seq_length):
+                x_t = x[:, t, :]  # [batch_size, input_size]
+                x_t_transform = self.U_2e(x_t)  # [batch_size, hidden_size]
+                
+                # 计算注意力分数
+                attention = torch.tanh(h_s_transform + x_t_transform)  # [batch_size, hidden_size]
+                score = torch.matmul(attention, self.v_2e)  # [batch_size]
+                attention_scores[:, t] += score  # 累加每层的分数
+        
+        # 应用Softmax得到注意力权重 - 对时间维度进行归一化
+        attention_weights = F.softmax(attention_scores, dim=1)
+        return attention_weights
+    
+    def forward(self, x, y_prev=None, y_history=None):
+        """
+        TDA-RNN前向传播 - 按照论文要求修改，增加完整的历史数据输入
+        Args:
+            x: 输入序列 [batch_size, seq_length, input_size]
+            y_prev: 上一个时间步的预测值 [batch_size, output_size]
+            y_history: 历史数据序列 [batch_size, seq_length, input_size]
+        """
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+        
+        batch_size, seq_length, input_size = x.size()
+        device = x.device
+        
+        # 如果没有提供历史数据，使用输入序列作为历史数据
+        if y_history is None:
+            y_history = x
+        
+        # 1. 特征编码和类别注意力
+        # 初始化LSTM状态
+        h_t = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+        s_t = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+        
+        # 存储所有时间步的状态
+        h_states = []
+        s_states = []
+        
+        # 对每个时间步运行LSTM
+        for t in range(seq_length):
+            _, (h_t, s_t) = self.feature_encoder_lstm(
+                x[:, t:t+1, :],
+                (h_t, s_t)
+            )
+            # 只保存最后一层的状态用于注意力计算
+            h_states.append(h_t[-1])
+            s_states.append(s_t[-1])
+        
+        # 将状态列表转换为张量
+        h_states = torch.stack(h_states)  # [seq_length, batch_size, hidden_size]
+        s_states = torch.stack(s_states)  # [seq_length, batch_size, hidden_size]
+        
+        # 计算类别注意力权重
+        category_attention = self.compute_category_attention(x, h_states, s_states)
+        
+        # 2. 时序编码和时序注意力
+        temporal_output, (temporal_h, temporal_s) = self.temporal_encoder_lstm(x)
+        temporal_attention = self.compute_temporal_attention(x, temporal_h, temporal_s)
+        
+        # 3. 注意力融合 - 按照论文公式(9)实现
+        # 扩展时序注意力权重以匹配类别注意力权重的维度
+        temporal_attention = temporal_attention.unsqueeze(-1).expand(-1, -1, input_size)
+        
+        # 融合注意力权重
+        combined_attention = category_attention + temporal_attention  # [batch_size, seq_length, input_size]
+        
+        # 4. 应用注意力权重到输入
+        weighted_input = x * combined_attention
+        
+        # 5. 特征融合编码
+        fusion_output, (fusion_h, fusion_c) = self.fusion_encoder_lstm(weighted_input)
+        
+        # 6. 解码器处理 - 修改以使用完整的历史数据
+        if y_prev is None:
+            y_prev = torch.zeros(batch_size, self.output_size).to(device)
+        
+        # 获取最后一个时间步的隐藏状态
+        h_t_minus_1 = fusion_output[:, -1, :]  # [batch_size, hidden_size]
+        
+        # 使用最后一个时间步的历史数据
+        y_hist_last = y_history[:, -1, :]  # [batch_size, input_size]
+        
+        # 按照论文要求融合历史数据和隐藏状态
+        decoder_input = torch.cat([y_hist_last, h_t_minus_1], dim=1)  # [batch_size, input_size + hidden_size]
+        decoder_hidden = self.decoder_fusion(decoder_input)
+        decoder_hidden = torch.tanh(decoder_hidden)
+        decoder_hidden = self.dropout_layer(decoder_hidden)
+        
+        # 通过LSTM更新隐藏状态，使用完整的历史数据
+        decoder_input_seq = torch.cat([y_history, fusion_output], dim=2)  # 连接历史数据和编码特征
+        decoder_output, _ = self.decoder_lstm(decoder_input_seq)
+        
+        # 生成最终预测
+        final_hidden = decoder_output[:, -1, :]  # [batch_size, hidden_size]
+        final_hidden = self.dropout_layer(final_hidden)
+        predictions = self.decoder_output(final_hidden)  # [batch_size, output_size]
+        
+        return predictions
+
+
+# 位置编码类
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.d_model = d_model  # 添加d_model属性
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+        
+        # 添加一个线性层用于维度变换
+        self.dim_mapper = None
+
+    def forward(self, x):
+        # 确保输入张量的最后一个维度与位置编码的维度匹配
+        if x.size(-1) != self.d_model:
+            # 如果是第一次遇到不匹配的维度，创建一个线性变换层
+            if self.dim_mapper is None or self.dim_mapper.in_features != x.size(-1):
+                self.dim_mapper = nn.Linear(x.size(-1), self.d_model).to(x.device)
+            # 使用线性投影调整维度
+            x = self.dim_mapper(x)
+        
+        # 添加位置编码
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+
+# 修改后的简化训练函数
+def train_model_simple(model, X_train, y_train, X_val, y_val, X_test, y_test, 
+                      scaler_y=None, epochs=200, lr=0.001, batch_size=32, weight_decay=1e-5):
+    """简化版本的模型训练函数 - 增加权重衰减和更多训练轮次"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 将NumPy数组转换为PyTorch张量
+    X_train_tensor = torch.FloatTensor(X_train).to(device)
+    y_train_tensor = torch.FloatTensor(y_train).to(device)
+    X_val_tensor = torch.FloatTensor(X_val).to(device)
+    y_val_tensor = torch.FloatTensor(y_val).to(device)
+    X_test_tensor = torch.FloatTensor(X_test).to(device)
+    y_test_tensor = torch.FloatTensor(y_test).to(device)
+    
+    # 对于神经网络模型的处理
+    model = model.to(device)
+    
+    # 定义损失函数
+    criterion = nn.MSELoss()
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
+    
+    # 训练循环
+    best_val_loss = float('inf')
+    best_model = None
+    patience = 20  # 增加耐心值
+    patience_counter = 0
+    
+    for epoch in range(epochs):
+        model.train()
+        
+        # 创建数据加载器
+        train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        
+        # 训练一轮
+        train_loss = 0
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            
+            # 前向传播
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            
+            # 反向传播
+            loss.backward()
+            # 梯度裁剪以防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_loss += loss.item() * batch_X.size(0)
+        
+        train_loss /= len(train_dataset)
+        
+        # 验证
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_tensor)
+            val_loss = criterion(val_outputs, y_val_tensor)
+            
+            # 打印状态
+            print(f'Epoch {epoch+1}/{epochs}, 训练损失: {train_loss:.6f}, 验证损失: {val_loss.item():.6f}')
+            
+            # 学习率调整
+            scheduler.step(val_loss)
+            
+            # 早停
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = model.state_dict().copy()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f'早停: 验证损失在{patience}轮内未改善')
+                    break
+    
+    # 使用最佳模型进行测试
+    if best_model is not None:
+        model.load_state_dict(best_model)
+    
+    # 测试评估
+    model.eval()
+    with torch.no_grad():
+        test_outputs = model(X_test_tensor)
+        
+        # 转为NumPy数组进行评估
+        test_pred = test_outputs.cpu().numpy()
+        test_true = y_test_tensor.cpu().numpy()
+        
+        # 计算评估指标
+        results = evaluate_model(test_true, test_pred, scaler_y)
+        
+        return model, results
+
+
+# 模型比较与评估 - 简化版
+def compare_models_simple(df, target_col='PM2.5', epochs=200, split_seed=42, sequence_length=3):
+    """使用简化方法比较不同模型的性能 - 调整参数和数据分割"""
+    print("开始简化的模型比较...")
+    
+    # 数据预处理
+    df = process_time_features(df)
+    df = feature_engineering(df)
+    
+    # 简化数据处理 - 使用0.7225:0.1275:0.15的比例划分
+    X_train, X_val, X_test, y_train, y_val, y_test, scaler_y = simple_data_preprocessing(
+        df, target_col=target_col, sequence_length=sequence_length
+    )
+    print(f"数据分割完成 - 训练集: {X_train.shape[0]}, 验证集: {X_val.shape[0]}, 测试集: {X_test.shape[0]}")
+    
+    # 模型参数
+    input_size = X_train.shape[1]
+    hidden_size = 128
+    output_size = 1
+    
+    # 存储结果
+    results = {}
+    
+    # 训练MA模型
+    print("\n开始评估MA模型...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ma_model = MAModel(window_size=sequence_length)
+    ma_model = ma_model.to(device)
+    
+    # MA模型不需要训练，直接评估
+    ma_model.eval()
+    with torch.no_grad():
+        X_test_tensor = torch.FloatTensor(X_test).to(device)
+        y_test_tensor = torch.FloatTensor(y_test).to(device)
+        test_outputs = ma_model(X_test_tensor)
+        test_pred = test_outputs.cpu().numpy()
+        test_true = y_test
+        ma_results = evaluate_model(test_true, test_pred, scaler_y)
+    results['MA'] = ma_results
+    
+    # 训练BPNN模型
+    print("\n开始训练BPNN模型...")
+    bpnn_model = BPNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, dropout=0.2)
+    _, bpnn_results = train_model_simple(
+        bpnn_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['BPNN'] = bpnn_results
+    
+    # 训练GRU模型
+    print("\n开始训练GRU模型...")
+    gru_model = GRU(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+    _, gru_results = train_model_simple(
+        gru_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['GRU'] = gru_results
+    
+    # 训练LSTM模型
+    print("\n开始训练LSTM模型...")
+    lstm_model = LSTM(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+    _, lstm_results = train_model_simple(
+        lstm_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['LSTM'] = lstm_results
+    
+    # 训练TDA-RNN模型
+    print("\n开始训练TDA-RNN模型...")
+    tda_rnn_model = TDA_RNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+    _, tda_rnn_results = train_model_simple(
+        tda_rnn_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['TDA-RNN'] = tda_rnn_results
+    
+    # 比较结果
+    print("\n模型性能比较:")
+    comparison_table = pd.DataFrame({
+        '模型': list(results.keys()),
+        'R²': [results[model]['r2'] for model in results],
+        'RMSE': [results[model]['rmse'] for model in results],
+        'MAE': [results[model]['mae'] for model in results],
+        'MAPE (%)': [results[model]['mape'] for model in results]
+    })
+    
+    # 按R²值排序
+    comparison_table = comparison_table.sort_values(by='R²', ascending=False)
+    comparison_table = comparison_table.reset_index(drop=True)
+    
+    # 格式化输出
+    comparison_table['R²'] = comparison_table['R²'].apply(lambda x: f'{x:.4f}')
+    comparison_table['RMSE'] = comparison_table['RMSE'].apply(lambda x: f'{x:.4f}')
+    comparison_table['MAE'] = comparison_table['MAE'].apply(lambda x: f'{x:.4f}')
+    comparison_table['MAPE (%)'] = comparison_table['MAPE (%)'].apply(lambda x: f'{x:.2f}')
+    
+    print(comparison_table.to_string(index=False))
+    
+    return results
+
+
+# 可视化函数
+def visualize_results(results_df):
+    """可视化模型比较结果"""
+    # 转换数值列为浮点数
+    results_df['R²'] = results_df['R²'].astype(float)
+    results_df['RMSE'] = results_df['RMSE'].astype(float)
+    results_df['MAE'] = results_df['MAE'].astype(float)
+    results_df['MAPE (%)'] = results_df['MAPE (%)'].astype(float)
+    
+    plt.figure(figsize=(15, 10))
+    
+    # R2对比
+    plt.subplot(2, 2, 1)
+    plt.bar(results_df['模型'], results_df['R²'])
+    plt.title('R² 对比')
+    plt.ylabel('R² (越高越好)')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # RMSE对比
+    plt.subplot(2, 2, 2)
+    plt.bar(results_df['模型'], results_df['RMSE'])
+    plt.title('RMSE 对比')
+    plt.ylabel('RMSE (越低越好)')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # MAE对比
+    plt.subplot(2, 2, 3)
+    plt.bar(results_df['模型'], results_df['MAE'])
+    plt.title('MAE 对比')
+    plt.ylabel('MAE (越低越好)')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # MAPE对比
+    plt.subplot(2, 2, 4)
+    plt.bar(results_df['模型'], results_df['MAPE (%)'])
+    plt.title('MAPE 对比')
+    plt.ylabel('MAPE % (越低越好)')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.ylim(0, 100)  # 设置MAPE图的y轴上限为100
+    
+    plt.tight_layout()
+    plt.savefig('model_comparison.png')
+    print("已保存可视化结果到 model_comparison.png")
+
+
+# 新增: 交叉验证评估函数
+def cross_validate_models(df, target_col='PM2.5', n_splits=5, epochs=100, batch_size=16, hidden_size=128, sequence_length=3):
+    """使用交叉验证评估多个模型的性能，在不同数据分割下检验表现"""
+    print(f"开始{n_splits}折交叉验证评估...")
+    
+    # 数据预处理
+    df = process_time_features(df)
+    df = feature_engineering(df)
+    
+    # 提取特征和目标
+    features = [col for col in df.columns if col != target_col]
+    X = df[features].values
+    y = df[target_col].values.reshape(-1, 1)
+    
+    # 初始化K折交叉验证
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    # 存储所有结果
+    all_results = {
+        'MA': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'BPNN': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'GRU': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'LSTM': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'TDA-RNN': {'r2': [], 'rmse': [], 'mae': [], 'mape': []}
+    }
+    
+    # 记录训练时间
+    training_times = {model: [] for model in all_results.keys()}
+    
+    # 对每个折进行训练和评估
+    for fold, (train_idx, test_idx) in enumerate(kf.split(X)):
+        print(f"\n开始第 {fold+1}/{n_splits} 折交叉验证...")
+        
+        # 分割数据为训练集和测试集
+        X_train_full, X_test = X[train_idx], X[test_idx]
+        y_train_full, y_test = y[train_idx], y[test_idx]
+        
+        # 进一步分割训练集为训练集和验证集
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_full, y_train_full, test_size=0.2, random_state=42
+        )
+        
+        # 标准化特征和目标
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+        
+        X_train = scaler_X.fit_transform(X_train)
+        y_train = scaler_y.fit_transform(y_train)
+        X_val = scaler_X.transform(X_val)
+        y_val = scaler_y.transform(y_val)
+        X_test = scaler_X.transform(X_test)
+        y_test = scaler_y.transform(y_test)
+        
+        # 设置模型参数
+        input_size = X_train.shape[1]
+        hidden_size = hidden_size
+        output_size = 1
+        
+        # 评估MA模型
+        print("\n评估MA模型...")
+        start_time = time.time()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 创建带噪声的MA模型
+        ma_model = MAModel(
+            window_size=sequence_length,
+            output_size=output_size,
+            noise_std=0.1,  # 设置噪声标准差
+            noise_mean=0.0,  # 设置噪声均值
+            use_noise=True  # 启用噪声
+        )
+        ma_model = ma_model.to(device)
+        
+        with torch.no_grad():
+            X_test_tensor = torch.FloatTensor(X_test).to(device)
+            test_outputs = ma_model(X_test_tensor)
+            test_pred = test_outputs.cpu().numpy()
+            test_true = y_test
+            ma_results = evaluate_model(test_true, test_pred, scaler_y)
+        
+        training_time = time.time() - start_time
+        training_times['MA'].append(training_time)
+        
+        # 存储MA模型结果
+        all_results['MA']['r2'].append(ma_results['r2'])
+        all_results['MA']['rmse'].append(ma_results['rmse'])
+        all_results['MA']['mae'].append(ma_results['mae'])
+        all_results['MA']['mape'].append(ma_results['mape'])
+        
+        # 对其他模型进行训练和评估
+        models = {
+            'BPNN': BPNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, dropout=0.2),
+            'GRU': GRU(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2),
+            'LSTM': LSTM(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2),
+            'TDA-RNN': TDA_RNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+        }
+        
+        for model_name, model in models.items():
+            print(f"\n训练 {model_name} 模型...")
+            start_time = time.time()
+            
+            # 训练模型
+            trained_model, results = train_model_simple(
+                model, X_train, y_train, X_val, y_val, X_test, y_test, 
+                scaler_y=scaler_y, epochs=epochs, batch_size=batch_size, weight_decay=1e-5
+            )
+            
+            # 记录训练时间
+            training_time = time.time() - start_time
+            training_times[model_name].append(training_time)
+            print(f"{model_name} 训练时间: {training_time:.2f} 秒")
+            
+            # 存储结果
+            all_results[model_name]['r2'].append(results['r2'])
+            all_results[model_name]['rmse'].append(results['rmse'])
+            all_results[model_name]['mae'].append(results['mae'])
+            all_results[model_name]['mape'].append(results['mape'])
+    
+    # 计算均值和标准差
+    summary_results = {}
+    for model_name in all_results.keys():
+        summary_results[model_name] = {
+            'r2_mean': np.mean(all_results[model_name]['r2']),
+            'r2_std': np.std(all_results[model_name]['r2']),
+            'rmse_mean': np.mean(all_results[model_name]['rmse']),
+            'rmse_std': np.std(all_results[model_name]['rmse']),
+            'mae_mean': np.mean(all_results[model_name]['mae']),
+            'mae_std': np.std(all_results[model_name]['mae']),
+            'mape_mean': np.mean(all_results[model_name]['mape']),
+            'mape_std': np.std(all_results[model_name]['mape']),
+            'train_time_mean': np.mean(training_times[model_name]),
+            'train_time_std': np.std(training_times[model_name])
+        }
+    
+    # 创建摘要表格
+    summary_df = pd.DataFrame({
+        '模型': list(summary_results.keys()),
+        'R² (均值±标准差)': [f'{summary_results[m]["r2_mean"]:.4f} ± {summary_results[m]["r2_std"]:.4f}' for m in summary_results],
+        'RMSE (均值±标准差)': [f'{summary_results[m]["rmse_mean"]:.4f} ± {summary_results[m]["rmse_std"]:.4f}' for m in summary_results],
+        'MAE (均值±标准差)': [f'{summary_results[m]["mae_mean"]:.4f} ± {summary_results[m]["mae_std"]:.4f}' for m in summary_results],
+        'MAPE % (均值±标准差)': [f'{summary_results[m]["mape_mean"]:.2f} ± {summary_results[m]["mape_std"]:.2f}' for m in summary_results],
+        '训练时间 (秒)': [f'{summary_results[m]["train_time_mean"]:.2f} ± {summary_results[m]["train_time_std"]:.2f}' for m in summary_results]
+    })
+    
+    # 按R²均值排序
+    r2_means = {m: summary_results[m]["r2_mean"] for m in summary_results}
+    summary_df = summary_df.iloc[sorted(range(len(r2_means)), key=lambda i: r2_means[summary_df.iloc[i]['模型']], reverse=True)]
+    summary_df = summary_df.reset_index(drop=True)
+    
+    # 打印摘要表格
+    print("\n交叉验证结果摘要:")
+    print(summary_df.to_string(index=False))
+    
+    # 可视化交叉验证结果
+    visualize_cross_validation_results(all_results, with_noise=False)
+    
+    return all_results, summary_results
+
+
+# 新增: 可视化交叉验证结果
+def visualize_cross_validation_results(all_results, with_noise=False):
+    """可视化交叉验证结果"""
+    plt.figure(figsize=(12, 8))
+    
+    # 准备数据
+    data = []
+    labels = []
+    for model_name in all_results.keys():
+        if model_name != 'training_times':
+            data.append(all_results[model_name]['mape'])
+            labels.append(model_name)
+    
+    # 创建箱线图
+    plt.boxplot(data, labels=labels)
+    
+    # 设置图表属性
+    title = 'APE Distribution Across Models (With Noise)' if with_noise else 'APE Distribution Across Models'
+    plt.title(title, fontsize=14)
+    plt.xlabel('Models', fontsize=12)
+    plt.ylabel('APE (%)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # 设置y轴范围为0-100
+    plt.ylim(0, 100)
+    
+    # 保存图表，使用固定文件名
+    filename = 'ape_boxplot_with_noise.png' if with_noise else 'ape_boxplot.png'
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"\n已保存APE箱线图到 {filename}")
+
+
+# 新增: 带噪声的数据预处理函数
+def noisy_data_preprocessing(df, target_col='PM2.5', noise_std=1.0, noise_count=1, noise_mean=0.0):
+    """
+    添加随机噪声特征到数据中，然后进行预处理
+    
+    参数:
+        df: 输入的DataFrame
+        target_col: 目标列名
+        noise_std: 噪声的标准差
+        noise_count: 要添加的噪声特征数量
+        noise_mean: 噪声的均值
+    返回:
+        处理后的训练集、验证集、测试集及标准化器
+    """
+    print(f"使用带噪声的数据预处理方法，添加{noise_count}个噪声特征...")
+    print(f"噪声参数 - 均值: {noise_mean}, 标准差: {noise_std}")
+    
+    # 复制DataFrame避免修改原始数据
+    df_with_noise = df.copy()
+    
+    # 添加噪声特征
+    np.random.seed(42)  # 设置随机种子以便结果可重复
+    n_samples = len(df)
+    
+    # 计算目标变量的统计特征
+    target_mean = df[target_col].mean()
+    target_std = df[target_col].std()
+    
+    for i in range(noise_count):
+        # 生成符合正态分布的随机噪声，使用目标变量的统计特征来缩放
+        noise = np.random.normal(noise_mean, noise_std, size=n_samples)
+        # 将噪声缩放到与目标变量相似的尺度
+        noise = noise * target_std + target_mean
+        noise_col_name = f'random_noise_{i+1}'
+        df_with_noise[noise_col_name] = noise
+        
+        # 计算噪声特征与目标变量的相关性
+        correlation = df_with_noise[noise_col_name].corr(df_with_noise[target_col])
+        print(f"添加噪声特征: {noise_col_name}")
+        print(f"噪声统计 - 均值: {np.mean(noise):.4f}, 标准差: {np.std(noise):.4f}")
+        print(f"与目标变量的相关性: {correlation:.4f}")
+    
+    # 可视化噪声特征
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.hist(df[target_col], bins=50, alpha=0.5, label='Original Target')
+    plt.hist(df_with_noise[f'random_noise_1'], bins=50, alpha=0.5, label='Noise Feature')
+    plt.title('Distribution Comparison')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.scatter(df[target_col], df_with_noise[f'random_noise_1'], alpha=0.5)
+    plt.title('Noise vs Target Scatter Plot')
+    plt.xlabel('Target')
+    plt.ylabel('Noise')
+    
+    plt.tight_layout()
+    plt.savefig('noise_visualization.png')
+    print("已保存噪声特征可视化到 noise_visualization.png")
+    
+    # 分离特征和目标
+    features = [col for col in df_with_noise.columns if col != target_col]
+    X = df_with_noise[features].values
+    y = df_with_noise[target_col].values.reshape(-1, 1)
+    
+    # 标准化特征和目标
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y)
+    
+    # 划分数据集 - 使用0.7225:0.1275:0.15的比例
+    n_samples = len(X_scaled)
+    train_size = int(n_samples * 0.7225)
+    val_size = int(n_samples * 0.1275)
+    
+    # 首先划分训练集
+    X_train = X_scaled[:train_size]
+    y_train = y_scaled[:train_size]
+    
+    # 然后划分验证集
+    X_val = X_scaled[train_size:train_size+val_size]
+    y_val = y_scaled[train_size:train_size+val_size]
+    
+    # 最后划分测试集
+    X_test = X_scaled[train_size+val_size:]
+    y_test = y_scaled[train_size+val_size:]
+    
+    print(f"带噪声数据集划分完成 - 训练集: {len(X_train)}, 验证集: {len(X_val)}, 测试集: {len(X_test)}")
+    print(f"特征维度: {X_train.shape[1]}，包含{noise_count}个噪声特征")
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, scaler_y
+
+
+# 带噪声的模型比较与评估函数
+def compare_models_with_noise(df, target_col='PM2.5', epochs=200, noise_std=1.0, noise_count=1, noise_mean=0.0):
+    """
+    使用带有随机噪声特征的数据比较不同模型的性能
+    
+    参数:
+        df: 输入的DataFrame
+        target_col: 目标列名
+        epochs: 训练轮数
+        noise_std: 噪声的标准差
+        noise_count: 要添加的噪声特征数量
+        noise_mean: 噪声的均值
+    返回:
+        包含各模型评估结果的字典
+    """
+    print(f"开始带噪声特征的模型比较...")
+    print(f"噪声参数 - 数量: {noise_count}, 均值: {noise_mean}, 标准差: {noise_std}")
+    
+    # 数据预处理
+    df = process_time_features(df)
+    df = feature_engineering(df)
+    
+    # 使用带噪声的数据预处理方法
+    X_train, X_val, X_test, y_train, y_val, y_test, scaler_y = noisy_data_preprocessing(
+        df, target_col=target_col, noise_std=noise_std, noise_count=noise_count, noise_mean=noise_mean
+    )
+    
+    # 模型参数
+    input_size = X_train.shape[1]  # 输入维度会增加噪声特征数量
+    hidden_size = 128
+    output_size = 1
+    
+    # 存储结果
+    results = {}
+    
+    # 训练BPNN模型
+    print("\n开始训练BPNN模型...")
+    bpnn_model = BPNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, dropout=0.2)
+    _, bpnn_results = train_model_simple(
+        bpnn_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['BPNN'] = bpnn_results
+    
+    # 训练GRU模型
+    print("\n开始训练GRU模型...")
+    gru_model = GRU(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+    _, gru_results = train_model_simple(
+        gru_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['GRU'] = gru_results
+    
+    # 训练LSTM模型
+    print("\n开始训练LSTM模型...")
+    lstm_model = LSTM(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+    _, lstm_results = train_model_simple(
+        lstm_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['LSTM'] = lstm_results
+    
+    # 训练TDA-RNN模型
+    print("\n开始训练TDA-RNN模型...")
+    tda_rnn_model = TDA_RNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+    _, tda_rnn_results = train_model_simple(
+        tda_rnn_model, X_train, y_train, X_val, y_val, X_test, y_test, 
+        scaler_y=scaler_y, epochs=epochs, batch_size=16, lr=0.0005, weight_decay=1e-5
+    )
+    results['TDA-RNN'] = tda_rnn_results
+    
+    # 比较结果
+    print("\n带噪声模型性能比较:")
+    comparison_table = pd.DataFrame({
+        '模型': list(results.keys()),
+        'R²': [results[model]['r2'] for model in results],
+        'RMSE': [results[model]['rmse'] for model in results],
+        'MAE': [results[model]['mae'] for model in results],
+        'MAPE (%)': [results[model]['mape'] for model in results]
+    })
+    
+    # 按R²值排序
+    comparison_table = comparison_table.sort_values(by='R²', ascending=False)
+    comparison_table = comparison_table.reset_index(drop=True)
+    
+    # 格式化输出
+    comparison_table['R²'] = comparison_table['R²'].apply(lambda x: f'{x:.4f}')
+    comparison_table['RMSE'] = comparison_table['RMSE'].apply(lambda x: f'{x:.4f}')
+    comparison_table['MAE'] = comparison_table['MAE'].apply(lambda x: f'{x:.4f}')
+    comparison_table['MAPE (%)'] = comparison_table['MAPE (%)'].apply(lambda x: f'{x:.2f}')
+    
+    print(comparison_table.to_string(index=False))
+    
+    return results
+
+
+# 新增: 带噪声的交叉验证评估函数
+def cross_validate_models_with_noise(df, target_col='PM2.5', n_splits=5, epochs=100, batch_size=16, 
+                                   noise_std=1.0, noise_count=1, noise_mean=0.0, sequence_length=3):
+    print(f"开始{n_splits}折带噪声交叉验证评估...")
+    print(f"噪声参数 - 数量: {noise_count}, 均值: {noise_mean}, 标准差: {noise_std}")
+    
+    # 数据预处理
+    df = process_time_features(df)
+    df = feature_engineering(df)
+    
+    # 添加噪声特征
+    df_with_noise = df.copy()
+    np.random.seed(42)
+    n_samples = len(df)
+    
+    for i in range(noise_count):
+        noise = np.random.normal(noise_mean, noise_std, size=n_samples)
+        noise_col_name = f'random_noise_{i+1}'
+        df_with_noise[noise_col_name] = noise
+        print(f"添加噪声特征: {noise_col_name}, 均值: {np.mean(noise):.4f}, 标准差: {np.std(noise):.4f}")
+    
+    # 提取特征和目标
+    features = [col for col in df_with_noise.columns if col != target_col]
+    X = df_with_noise[features].values
+    y = df_with_noise[target_col].values.reshape(-1, 1)
+    
+    # 初始化K折交叉验证
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    # 存储所有结果
+    all_results = {
+        'MA': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'BPNN': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'GRU': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'LSTM': {'r2': [], 'rmse': [], 'mae': [], 'mape': []},
+        'TDA-RNN': {'r2': [], 'rmse': [], 'mae': [], 'mape': []}
+    }
+    
+    # 记录训练时间
+    training_times = {model: [] for model in all_results.keys()}
+    
+    # 对每个折进行训练和评估
+    for fold, (train_idx, test_idx) in enumerate(kf.split(X)):
+        print(f"\n开始第 {fold+1}/{n_splits} 折交叉验证...")
+        
+        # 分割数据为训练集和测试集
+        X_train_full, X_test = X[train_idx], X[test_idx]
+        y_train_full, y_test = y[train_idx], y[test_idx]
+        
+        # 进一步分割训练集为训练集和验证集
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_full, y_train_full, test_size=0.2, random_state=42
+        )
+        
+        # 标准化特征和目标
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+        
+        X_train = scaler_X.fit_transform(X_train)
+        y_train = scaler_y.fit_transform(y_train)
+        X_val = scaler_X.transform(X_val)
+        y_val = scaler_y.transform(y_val)
+        X_test = scaler_X.transform(X_test)
+        y_test = scaler_y.transform(y_test)
+        
+        # 设置模型参数
+        input_size = X_train.shape[1]
+        hidden_size = 128
+        output_size = 1
+        
+        # 评估MA模型
+        print("\n评估MA模型...")
+        start_time = time.time()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 创建带噪声的MA模型
+        ma_model = MAModel(
+            window_size=sequence_length,
+            output_size=output_size,
+            noise_std=0.1,  # 设置噪声标准差
+            noise_mean=0.0,  # 设置噪声均值
+            use_noise=True  # 启用噪声
+        )
+        ma_model = ma_model.to(device)
+        
+        with torch.no_grad():
+            X_test_tensor = torch.FloatTensor(X_test).to(device)
+            test_outputs = ma_model(X_test_tensor)
+            test_pred = test_outputs.cpu().numpy()
+            test_true = y_test
+            ma_results = evaluate_model(test_true, test_pred, scaler_y)
+        
+        training_time = time.time() - start_time
+        training_times['MA'].append(training_time)
+        
+        # 存储MA模型结果
+        all_results['MA']['r2'].append(ma_results['r2'])
+        all_results['MA']['rmse'].append(ma_results['rmse'])
+        all_results['MA']['mae'].append(ma_results['mae'])
+        all_results['MA']['mape'].append(ma_results['mape'])
+        
+        # 对其他模型进行训练和评估
+        models = {
+            'BPNN': BPNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, dropout=0.2),
+            'GRU': GRU(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2),
+            'LSTM': LSTM(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2),
+            'TDA-RNN': TDA_RNN(input_size=input_size, hidden_size=hidden_size, output_size=output_size, num_layers=2, dropout=0.2)
+        }
+        
+        for model_name, model in models.items():
+            print(f"\n训练 {model_name} 模型...")
+            start_time = time.time()
+            
+            # 训练模型
+            trained_model, results = train_model_simple(
+                model, X_train, y_train, X_val, y_val, X_test, y_test, 
+                scaler_y=scaler_y, epochs=epochs, batch_size=batch_size, weight_decay=1e-5
+            )
+            
+            # 记录训练时间
+            training_time = time.time() - start_time
+            training_times[model_name].append(training_time)
+            print(f"{model_name} 训练时间: {training_time:.2f} 秒")
+            
+            # 存储结果
+            all_results[model_name]['r2'].append(results['r2'])
+            all_results[model_name]['rmse'].append(results['rmse'])
+            all_results[model_name]['mae'].append(results['mae'])
+            all_results[model_name]['mape'].append(results['mape'])
+    
+    # 计算均值和标准差
+    summary_results = {}
+    for model_name in all_results.keys():
+        summary_results[model_name] = {
+            'r2_mean': np.mean(all_results[model_name]['r2']),
+            'r2_std': np.std(all_results[model_name]['r2']),
+            'rmse_mean': np.mean(all_results[model_name]['rmse']),
+            'rmse_std': np.std(all_results[model_name]['rmse']),
+            'mae_mean': np.mean(all_results[model_name]['mae']),
+            'mae_std': np.std(all_results[model_name]['mae']),
+            'mape_mean': np.mean(all_results[model_name]['mape']),
+            'mape_std': np.std(all_results[model_name]['mape']),
+            'train_time_mean': np.mean(training_times[model_name]),
+            'train_time_std': np.std(training_times[model_name])
+        }
+    
+    # 创建摘要表格
+    summary_df = pd.DataFrame({
+        '模型': list(summary_results.keys()),
+        'R² (均值±标准差)': [f'{summary_results[m]["r2_mean"]:.4f} ± {summary_results[m]["r2_std"]:.4f}' for m in summary_results],
+        'RMSE (均值±标准差)': [f'{summary_results[m]["rmse_mean"]:.4f} ± {summary_results[m]["rmse_std"]:.4f}' for m in summary_results],
+        'MAE (均值±标准差)': [f'{summary_results[m]["mae_mean"]:.4f} ± {summary_results[m]["mae_std"]:.4f}' for m in summary_results],
+        'MAPE % (均值±标准差)': [f'{summary_results[m]["mape_mean"]:.2f} ± {summary_results[m]["mape_std"]:.2f}' for m in summary_results],
+        '训练时间 (秒)': [f'{summary_results[m]["train_time_mean"]:.2f} ± {summary_results[m]["train_time_std"]:.2f}' for m in summary_results]
+    })
+    
+    # 按R²均值排序
+    r2_means = {m: summary_results[m]["r2_mean"] for m in summary_results}
+    summary_df = summary_df.iloc[sorted(range(len(r2_means)), key=lambda i: r2_means[summary_df.iloc[i]['模型']], reverse=True)]
+    summary_df = summary_df.reset_index(drop=True)
+    
+    # 打印摘要表格
+    print("\n带噪声交叉验证结果摘要:")
+    print(summary_df.to_string(index=False))
+    
+    # 可视化交叉验证结果
+    visualize_cross_validation_results(all_results, with_noise=True)
+    
+    return all_results, summary_results
+
+
+# 修改main部分，添加噪声选项
+def main():
+    # 加载数据
+    print("加载数据...")
+    try:
+        df = pd.read_excel('data.xlsx')
+        
+        # 数据预处理
+        print("\n执行数据预处理...")
+        df = process_time_features(df)
+        df = feature_engineering(df)
+        
+        # 设置交叉验证参数
+        print("\n设置交叉验证参数")
+        n_splits = 5  # 保持5折交叉验证
+        epochs = 100  # 减少到100轮，进一步优化训练时间
+        sequence_length = 3  # 添加序列长度参数
+        print(f"使用{n_splits}折交叉验证")
+        print(f"每折训练{epochs}轮")
+        print(f"序列长度: {sequence_length}")
+        
+        use_noise = input("是否添加噪声特征？(y/n): ").lower() == 'y'
+        
+        if use_noise:
+            # 自动设置推荐的噪声参数
+            noise_count = 2  # 推荐值
+            noise_std = 0.2  # 推荐值
+            noise_mean = 0.0  # 推荐值
+            print(f"\n使用推荐的噪声参数:")
+            print(f"噪声特征数量: {noise_count}")
+            print(f"噪声标准差: {noise_std}")
+            print(f"噪声均值: {noise_mean}")
+            
+            # 执行带噪声的交叉验证
+            all_results, summary_results = cross_validate_models_with_noise(
+                df, target_col='PM2.5', n_splits=n_splits, epochs=epochs,
+                noise_std=noise_std, noise_count=noise_count, noise_mean=noise_mean,
+                sequence_length=sequence_length
+            )
+        else:
+            # 执行标准交叉验证
+            all_results, summary_results = cross_validate_models(
+                df, target_col='PM2.5', n_splits=n_splits, epochs=epochs,
+                sequence_length=sequence_length
+            )
+        
+        print("\n交叉验证评估完成！")
+    except Exception as e:
+        print(f"数据加载或处理时发生错误: {str(e)}")
+
+
+# MA模型实现
+class MAModel(nn.Module):
+    def __init__(self, window_size=10, output_size=1, noise_std=0.1, noise_mean=0.0, use_noise=False):
+        super(MAModel, self).__init__()
+        self.window_size = window_size
+        self.output_size = output_size
+        self.noise_std = noise_std
+        self.noise_mean = noise_mean
+        self.use_noise = use_noise
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.data_stats = {'mean': None, 'std': None}
+    
+    def update_data_stats(self, x):
+        """更新数据的统计特征"""
+        if self.data_stats['mean'] is None:
+            self.data_stats['mean'] = torch.mean(x, dim=0, keepdim=True)
+            self.data_stats['std'] = torch.std(x, dim=0, keepdim=True)
+    
+    def add_noise(self, x):
+        """向输入数据添加缩放后的高斯噪声"""
+        if not self.use_noise:
+            return x
+            
+        # 更新数据统计特征
+        self.update_data_stats(x)
+        
+        # 生成与输入相同形状的噪声
+        noise = torch.randn_like(x)
+        
+        # 根据数据标准差缩放噪声
+        scaled_noise = noise * self.noise_std * self.data_stats['std']
+        
+        # 添加噪声
+        return x + scaled_noise
+    
+    def calculate_moving_average(self, x):
+        device = x.device
+        
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+            
+        batch_size, seq_len, features = x.shape
+        effective_window = min(self.window_size, seq_len)
+        
+        # 取最后effective_window个时间步的第一个特征
+        recent_values = x[:, -effective_window:, 0]
+        
+        # 添加噪声
+        recent_values = self.add_noise(recent_values)
+        
+        # 计算简单移动平均
+        moving_avg = torch.mean(recent_values, dim=1, keepdim=True)
+        
+        return moving_avg
+        
+    def weighted_moving_average(self, x, weights=None):
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+            
+        batch_size, seq_len, features = x.shape
+        device = x.device
+        effective_window = min(self.window_size, seq_len)
+        
+        recent_values = x[:, -effective_window:, 0]
+        recent_values = self.add_noise(recent_values)
+        
+        if weights is None:
+            weights = torch.linspace(0.5, 1.0, effective_window).to(device)
+            weights = weights / weights.sum()
+        
+        weighted_avg = torch.sum(recent_values * weights.unsqueeze(0), dim=1, keepdim=True)
+        
+        return weighted_avg
+    
+    def exponential_moving_average(self, x, alpha=0.3):
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+            
+        batch_size, seq_len, features = x.shape
+        effective_window = min(self.window_size, seq_len)
+        
+        recent_values = x[:, -effective_window:, 0]
+        recent_values = self.add_noise(recent_values)
+        
+        ema = torch.zeros(batch_size, 1).to(x.device)
+        
+        if effective_window > 0:
+            ema = recent_values[:, 0].unsqueeze(1)
+            
+            for t in range(1, effective_window):
+                ema = alpha * recent_values[:, t].unsqueeze(1) + (1 - alpha) * ema
+        
+        return ema
+    
+    def forward(self, x, y_prev=None, method='simple'):
+        self.device = x.device
+
+        if method == 'weighted':
+            return self.weighted_moving_average(x)
+        elif method == 'exponential':
+            return self.exponential_moving_average(x)
+        else:
+            return self.calculate_moving_average(x)
+
+
+if __name__ == "__main__":
+    main()
